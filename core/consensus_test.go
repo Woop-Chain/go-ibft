@@ -121,23 +121,6 @@ func quorum(numNodes uint64) uint64 {
 	}
 }
 
-func commonHasQuorumFn(numNodes uint64) func(blockNumber uint64, messages []*proto.Message, msgType proto.MessageType) bool {
-	quorum := quorum(numNodes)
-
-	return func(blockNumber uint64, messages []*proto.Message, msgType proto.MessageType) bool {
-		switch msgType {
-		case proto.MessageType_PREPREPARE:
-			return len(messages) >= 0
-		case proto.MessageType_PREPARE:
-			return len(messages) >= int(quorum)-1
-		case proto.MessageType_ROUND_CHANGE, proto.MessageType_COMMIT:
-			return len(messages) >= int(quorum)
-		}
-
-		return false
-	}
-}
-
 // TestConsensus_ValidFlow tests the following scenario:
 // N = 4
 //
@@ -147,13 +130,14 @@ func commonHasQuorumFn(numNodes uint64) func(blockNumber uint64, messages []*pro
 func TestConsensus_ValidFlow(t *testing.T) {
 	t.Parallel()
 
-	var (
-		multicastFn func(message *proto.Message)
+	var multicastFn func(message *proto.Message)
 
-		numNodes       = uint64(4)
-		nodes          = generateNodeAddresses(numNodes)
-		insertedBlocks = make([][]byte, numNodes)
-	)
+	proposal := []byte("proposal")
+	proposalHash := []byte("proposal hash")
+	committedSeal := []byte("seal")
+	numNodes := uint64(4)
+	nodes := generateNodeAddresses(numNodes)
+	insertedBlocks := make([][]byte, numNodes)
 
 	// commonTransportCallback is the common method modification
 	// required for Transport, for all nodes
@@ -167,7 +151,9 @@ func TestConsensus_ValidFlow(t *testing.T) {
 	// for the Backend, for all nodes
 	commonBackendCallback := func(backend *mockBackend, nodeIndex int) {
 		// Make sure the quorum function requires all nodes
-		backend.hasQuorumFn = commonHasQuorumFn(numNodes)
+		backend.quorumFn = func(_ uint64) uint64 {
+			return numNodes
+		}
 
 		// Make sure the node ID is properly relayed
 		backend.idFn = func() []byte {
@@ -181,12 +167,12 @@ func TestConsensus_ValidFlow(t *testing.T) {
 
 		// Make sure the proposal is valid if it matches what node 0 proposed
 		backend.isValidBlockFn = func(newProposal []byte) bool {
-			return bytes.Equal(newProposal, correctRoundMessage.proposal)
+			return bytes.Equal(newProposal, proposal)
 		}
 
 		// Make sure the proposal hash matches
 		backend.isValidProposalHashFn = func(p []byte, ph []byte) bool {
-			return bytes.Equal(p, correctRoundMessage.proposal) && bytes.Equal(ph, correctRoundMessage.hash)
+			return bytes.Equal(p, proposal) && bytes.Equal(ph, proposalHash)
 		}
 
 		// Make sure the preprepare message is built correctly
@@ -197,7 +183,7 @@ func TestConsensus_ValidFlow(t *testing.T) {
 		) *proto.Message {
 			return buildBasicPreprepareMessage(
 				proposal,
-				correctRoundMessage.hash,
+				proposalHash,
 				certificate,
 				nodes[nodeIndex],
 				view)
@@ -205,12 +191,12 @@ func TestConsensus_ValidFlow(t *testing.T) {
 
 		// Make sure the prepare message is built correctly
 		backend.buildPrepareMessageFn = func(proposal []byte, view *proto.View) *proto.Message {
-			return buildBasicPrepareMessage(correctRoundMessage.hash, nodes[nodeIndex], view)
+			return buildBasicPrepareMessage(proposalHash, nodes[nodeIndex], view)
 		}
 
 		// Make sure the commit message is built correctly
 		backend.buildCommitMessageFn = func(proposal []byte, view *proto.View) *proto.Message {
-			return buildBasicCommitMessage(correctRoundMessage.hash, correctRoundMessage.seal, nodes[nodeIndex], view)
+			return buildBasicCommitMessage(proposalHash, committedSeal, nodes[nodeIndex], view)
 		}
 
 		// Make sure the round change message is built correctly
@@ -226,19 +212,44 @@ func TestConsensus_ValidFlow(t *testing.T) {
 		backend.insertBlockFn = func(proposal []byte, _ []*messages.CommittedSeal) {
 			insertedBlocks[nodeIndex] = proposal
 		}
-
-		// Set the proposal creation method
-		backend.buildProposalFn = func(_ *proto.View) []byte {
-			return correctRoundMessage.proposal
-		}
 	}
+
+	var (
+		backendCallbackMap = map[int]backendConfigCallback{
+			0: func(backend *mockBackend) {
+				// Execute the common backend setup
+				commonBackendCallback(backend, 0)
+
+				// Set the proposal creation method for node 0, since
+				// they are the proposer
+				backend.buildProposalFn = func(u uint64) []byte {
+					return proposal
+				}
+			},
+			1: func(backend *mockBackend) {
+				commonBackendCallback(backend, 1)
+			},
+			2: func(backend *mockBackend) {
+				commonBackendCallback(backend, 2)
+			},
+			3: func(backend *mockBackend) {
+				commonBackendCallback(backend, 3)
+			},
+		}
+		transportCallbackMap = map[int]transportConfigCallback{
+			0: commonTransportCallback,
+			1: commonTransportCallback,
+			2: commonTransportCallback,
+			3: commonTransportCallback,
+		}
+	)
 
 	// Create the mock cluster
 	cluster := newMockCluster(
 		numNodes,
-		commonBackendCallback,
+		backendCallbackMap,
 		nil,
-		commonTransportCallback,
+		transportCallbackMap,
 	)
 
 	// Set the multicast callback to relay the message
@@ -255,7 +266,7 @@ func TestConsensus_ValidFlow(t *testing.T) {
 
 	// Make sure the inserted blocks match what node 0 proposed
 	for _, block := range insertedBlocks {
-		assert.True(t, bytes.Equal(block, correctRoundMessage.proposal))
+		assert.True(t, bytes.Equal(block, proposal))
 	}
 }
 
@@ -300,7 +311,14 @@ func TestConsensus_InvalidBlock(t *testing.T) {
 	// for the Backend, for all nodes
 	commonBackendCallback := func(backend *mockBackend, nodeIndex int) {
 		// Make sure the quorum function is Quorum optimal
-		backend.hasQuorumFn = commonHasQuorumFn(numNodes)
+		backend.quorumFn = func(_ uint64) uint64 {
+			return quorum(numNodes)
+		}
+
+		// Make sure the allowed faulty nodes function is accurate
+		backend.maximumFaultyNodesFn = func() uint64 {
+			return maxFaulty(numNodes)
+		}
 
 		// Make sure the node ID is properly relayed
 		backend.idFn = func() []byte {
@@ -368,19 +386,45 @@ func TestConsensus_InvalidBlock(t *testing.T) {
 		backend.insertBlockFn = func(proposal []byte, _ []*messages.CommittedSeal) {
 			insertedBlocks[nodeIndex] = proposal
 		}
-
-		// Build proposal function
-		backend.buildProposalFn = func(_ *proto.View) []byte {
-			return proposals[nodeIndex]
-		}
 	}
+
+	var (
+		backendCallbackMap = map[int]backendConfigCallback{
+			0: func(backend *mockBackend) {
+				commonBackendCallback(backend, 0)
+
+				backend.buildProposalFn = func(_ uint64) []byte {
+					return proposals[0]
+				}
+			},
+			1: func(backend *mockBackend) {
+				commonBackendCallback(backend, 1)
+
+				backend.buildProposalFn = func(_ uint64) []byte {
+					return proposals[1]
+				}
+			},
+			2: func(backend *mockBackend) {
+				commonBackendCallback(backend, 2)
+			},
+			3: func(backend *mockBackend) {
+				commonBackendCallback(backend, 3)
+			},
+		}
+		transportCallbackMap = map[int]transportConfigCallback{
+			0: commonTransportCallback,
+			1: commonTransportCallback,
+			2: commonTransportCallback,
+			3: commonTransportCallback,
+		}
+	)
 
 	// Create the mock cluster
 	cluster := newMockCluster(
 		numNodes,
-		commonBackendCallback,
+		backendCallbackMap,
 		nil,
-		commonTransportCallback,
+		transportCallbackMap,
 	)
 
 	// Set the base timeout to be lower than usual
